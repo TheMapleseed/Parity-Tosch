@@ -36,6 +36,8 @@ use crate::{
 	stats::StatSummary,
 	ColumnOptions, Key,
 };
+#[cfg(feature = "bytes")]
+use bytes::Bytes;
 use fs2::FileExt;
 use std::{
 	borrow::Borrow,
@@ -69,43 +71,55 @@ const MAX_LOG_FILES: usize = 4;
 pub type Value = Vec<u8>;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct RcValue(Arc<Value>);
-
-pub type RcKey = RcValue;
-
-impl RcValue {
-	pub fn value(&self) -> &Value {
-		&self.0
-	}
+pub enum RcValue {
+	#[cfg(feature = "arc")]
+	Arc(Arc<Value>),
+	#[cfg(feature = "bytes")]
+	Bytes(Bytes),
 }
 
 impl AsRef<[u8]> for RcValue {
 	fn as_ref(&self) -> &[u8] {
-		self.0.as_ref()
+		match self {
+			#[cfg(feature = "arc")]
+			Self::Arc(arc) => arc.as_ref(),
+			#[cfg(feature = "bytes")]
+			Self::Bytes(bytes) => bytes.as_ref(),
+		}
 	}
 }
 
 impl Borrow<[u8]> for RcValue {
 	fn borrow(&self) -> &[u8] {
-		self.value().borrow()
+		self.as_ref()
 	}
 }
 
-impl Borrow<Vec<u8>> for RcValue {
-	fn borrow(&self) -> &Vec<u8> {
-		self.value()
-	}
-}
-
+#[cfg(feature = "arc")]
 impl From<Value> for RcValue {
 	fn from(value: Value) -> Self {
-		Self(value.into())
+		Self::Arc(value.into())
 	}
 }
 
+#[cfg(not(feature = "arc"))]
+impl From<Value> for RcValue {
+	fn from(value: Value) -> Self {
+		Self::Bytes(value.into())
+	}
+}
+
+#[cfg(feature = "arc")]
 impl From<Arc<Value>> for RcValue {
 	fn from(value: Arc<Value>) -> Self {
-		Self(value)
+		Self::Arc(value)
+	}
+}
+
+#[cfg(feature = "bytes")]
+impl From<Bytes> for RcValue {
+	fn from(value: Bytes) -> Self {
+		Self::Bytes(value)
 	}
 }
 
@@ -114,7 +128,28 @@ impl<const N: usize> TryFrom<RcValue> for [u8; N] {
 	type Error = <[u8; N] as TryFrom<Vec<u8>>>::Error;
 
 	fn try_from(value: RcValue) -> std::result::Result<Self, Self::Error> {
-		value.value().clone().try_into()
+		value.as_ref().to_vec().try_into()
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RcKey(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for RcKey {
+	fn as_ref(&self) -> &[u8] {
+		self.0.as_ref()
+	}
+}
+
+impl Borrow<[u8]> for RcKey {
+	fn borrow(&self) -> &[u8] {
+		self.as_ref()
+	}
+}
+
+impl From<Vec<u8>> for RcKey {
+	fn from(key: Vec<u8>) -> Self {
+		Self(key.into())
 	}
 }
 
@@ -279,7 +314,7 @@ impl DbInner {
 				let overlay = self.commit_overlay.read();
 				// Check commit overlay first
 				if let Some(v) = overlay.get(col as usize).and_then(|o| o.get(&key)) {
-					return Ok(v.map(|i| i.value().clone()))
+					return Ok(v.map(|i| i.as_ref().to_vec()))
 				}
 				std::mem::drop(overlay);
 				// Go into tables and log overlay.
@@ -289,7 +324,7 @@ impl DbInner {
 			Column::Tree(column) => {
 				let overlay = self.commit_overlay.read();
 				if let Some(l) = overlay.get(col as usize).and_then(|o| o.btree_get(key)) {
-					return Ok(l.map(|i| i.value().clone()))
+					return Ok(l.map(|i| i.as_ref().to_vec()))
 				}
 				std::mem::drop(overlay);
 				// We lock log, if btree structure changed while reading that would be an issue.
@@ -320,7 +355,7 @@ impl DbInner {
 			Column::Tree(column) => {
 				let overlay = self.commit_overlay.read();
 				if let Some(l) = overlay.get(col as usize).and_then(|o| o.btree_get(key)) {
-					return Ok(l.map(|v| v.value().len() as u32))
+					return Ok(l.map(|v| v.as_ref().len() as u32))
 				}
 				let log = self.log.overlays().read();
 				let l = column.with_locked(|btree| BTreeTable::get(key, &*log, btree))?;
@@ -370,7 +405,7 @@ impl DbInner {
 				// Check commit overlay first
 				if let Some(v) = overlay.get(col as usize).and_then(|o| o.get_address(node_address))
 				{
-					return Ok(Some(unpack_node_data(v.value().clone())?))
+					return Ok(Some(unpack_node_data(v.as_ref().to_vec())?))
 				}
 				let log = self.log.overlays();
 				let value = column.get_value(Address::from_u64(node_address), log)?;
@@ -406,7 +441,7 @@ impl DbInner {
 				// Check commit overlay first
 				if let Some(v) = overlay.get(col as usize).and_then(|o| o.get_address(node_address))
 				{
-					return Ok(Some(unpack_node_children(v.value())?))
+					return Ok(Some(unpack_node_children(v.as_ref())?))
 				}
 				let log = self.log.overlays();
 				let value = column.get_value(Address::from_u64(node_address), log)?;
@@ -1573,9 +1608,21 @@ impl Db {
 	/// Commit a set of changes to the database.
 	///
 	/// This method passes values as `Arc<Vec<u8>>` potentially eliminating an extra copy.
+	#[cfg(feature = "arc")]
 	pub fn commit_changes_shared<I>(&self, tx: I) -> Result<()>
 	where
 		I: IntoIterator<Item = (ColId, Operation<Vec<u8>, Arc<Vec<u8>>>)>,
+	{
+		self.inner.commit_changes(tx)
+	}
+
+	/// Commit a set of changes to the database.
+	///
+	/// This method passes values as `Bytes` potentially eliminating an extra copy.
+	#[cfg(feature = "bytes")]
+	pub fn commit_changes_bytes<I>(&self, tx: I) -> Result<()>
+	where
+		I: IntoIterator<Item = (ColId, Operation<Vec<u8>, Bytes>)>,
 	{
 		self.inner.commit_changes(tx)
 	}
@@ -1870,7 +1917,7 @@ impl TreeReader for DbTreeReader {
 				let value = if let Some(v) =
 					overlay.get(self.col as usize).and_then(|o| o.get(&self.key))
 				{
-					Ok(v.map(|i| i.value().clone()))
+					Ok(v.map(|i| i.as_ref().to_vec()))
 				} else {
 					// Go into tables and log overlay.
 					let log = self.db.log.overlays();
@@ -1899,7 +1946,7 @@ impl TreeReader for DbTreeReader {
 
 pub type IndexedCommitOverlay = HashMap<Key, (u64, Option<RcValue>), IdentityBuildHasher>;
 pub type AddressCommitOverlay = HashMap<u64, (u64, RcValue)>;
-pub type BTreeCommitOverlay = BTreeMap<RcValue, (u64, Option<RcValue>)>;
+pub type BTreeCommitOverlay = BTreeMap<RcKey, (u64, Option<RcValue>)>;
 
 #[derive(Debug)]
 pub struct CommitOverlay {
@@ -1933,7 +1980,7 @@ impl CommitOverlay {
 	}
 
 	fn get_size(&self, key: &[u8]) -> Option<Option<u32>> {
-		self.get_ref(key).map(|res| res.as_ref().map(|b| b.value().len() as u32))
+		self.get_ref(key).map(|res| res.as_ref().map(|b| b.as_ref().len() as u32))
 	}
 
 	fn get_address(&self, address: u64) -> Option<RcValue> {
@@ -1944,53 +1991,47 @@ impl CommitOverlay {
 		self.btree_indexed.get(key).map(|(_, v)| v.as_ref())
 	}
 
-	pub fn btree_next(
-		&self,
-		last_key: &crate::btree::LastKey,
-	) -> Option<(RcValue, Option<RcValue>)> {
+	pub fn btree_next(&self, last_key: &crate::btree::LastKey) -> Option<(RcKey, Option<RcValue>)> {
 		use crate::btree::LastKey;
 		match &last_key {
 			LastKey::Start => self
 				.btree_indexed
-				.range::<Vec<u8>, _>(..)
+				.range::<[u8], _>(..)
 				.next()
 				.map(|(k, (_, v))| (k.clone(), v.clone())),
 			LastKey::End => None,
 			LastKey::At(key) => self
 				.btree_indexed
-				.range::<Vec<u8>, _>((Bound::Excluded(key), Bound::Unbounded))
+				.range::<[u8], _>((Bound::Excluded(key.as_slice()), Bound::Unbounded))
 				.next()
 				.map(|(k, (_, v))| (k.clone(), v.clone())),
 			LastKey::Seeked(key) => self
 				.btree_indexed
-				.range::<Value, _>(key..)
+				.range::<[u8], _>((Bound::Included(key.as_slice()), Bound::Unbounded))
 				.next()
 				.map(|(k, (_, v))| (k.clone(), v.clone())),
 		}
 	}
 
-	pub fn btree_prev(
-		&self,
-		last_key: &crate::btree::LastKey,
-	) -> Option<(RcValue, Option<RcValue>)> {
+	pub fn btree_prev(&self, last_key: &crate::btree::LastKey) -> Option<(RcKey, Option<RcValue>)> {
 		use crate::btree::LastKey;
 		match &last_key {
 			LastKey::End => self
 				.btree_indexed
-				.range::<Vec<u8>, _>(..)
+				.range::<[u8], _>(..)
 				.rev()
 				.next()
 				.map(|(k, (_, v))| (k.clone(), v.clone())),
 			LastKey::Start => None,
 			LastKey::At(key) => self
 				.btree_indexed
-				.range::<Vec<u8>, _>(..key)
+				.range::<[u8], _>((Bound::Unbounded, Bound::Excluded(key.as_slice())))
 				.rev()
 				.next()
 				.map(|(k, (_, v))| (k.clone(), v.clone())),
 			LastKey::Seeked(key) => self
 				.btree_indexed
-				.range::<Vec<u8>, _>(..=key)
+				.range::<[u8], _>((Bound::Unbounded, Bound::Included(key.as_slice())))
 				.rev()
 				.next()
 				.map(|(k, (_, v))| (k.clone(), v.clone())),
@@ -2156,7 +2197,7 @@ impl IndexedChangeSet {
 			match &change {
 				Operation::Set(k, v) => {
 					*bytes += k.len();
-					*bytes += v.value().len();
+					*bytes += v.as_ref().len();
 					overlay.indexed.insert(*k, (record_id, Some(v.clone())));
 				},
 				Operation::Dereference(k) => {
@@ -2183,7 +2224,7 @@ impl IndexedChangeSet {
 		}
 		for change in self.node_changes.iter() {
 			if let NodeChange::NewValue(address, val) = change {
-				*bytes += val.value().len();
+				*bytes += val.as_ref().len();
 				overlay.address.insert(*address, (record_id, val.clone()));
 			}
 		}
@@ -2220,7 +2261,7 @@ impl IndexedChangeSet {
 						*address,
 						val.clone(),
 						false,
-						val.value().len() as u32,
+						val.as_ref().len() as u32,
 						writer,
 					)?;
 				},
