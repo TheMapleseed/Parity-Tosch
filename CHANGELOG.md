@@ -4,7 +4,11 @@ The format is based on [Keep a Changelog].
 
 [Keep a Changelog]: http://keepachangelog.com/en/1.0.0/
 
-## [Unreleased]
+## [v0.5.4] - 2024-07-12
+
+-  Add commit_changes_bytes() method to Db [`#248`](https://github.com/paritytech/parity-db/pull/248)
+
+## [v0.5.3] - 2024-07-12
 
 - Add `Db::commit_changes_shared` that passes values as `Arc<Vec<u8>>`, potentially without an extra copy.
 
